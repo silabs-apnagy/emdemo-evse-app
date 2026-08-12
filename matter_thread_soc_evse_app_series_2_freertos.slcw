@@ -1,0 +1,17 @@
+---
+workspace_name: "matter_thread_soc_evse_app_series_2_freertos"
+label: "Matter Thread - SoC EVSE with external Bootloader FreeRTOS"
+quality: "production"
+package: "matter"
+description: "Demonstrates a sample implementation of a Matter over Thread EVSE app\
+  \ with external bootloader"
+project:
+- id: "application"
+  path: "matter_thread_soc_evse_app_freertos/matter_thread_soc_evse_app_freertos.slcp"
+  output: "matter_thread_soc_evse_app_freertos"
+- id: "bootloader"
+  path: "matter_bootloader_external_series_2/matter_bootloader_external_series_2.slcp"
+  output: "matter_bootloader_external_series_2"
+post_build:
+  profile: ""
+  path: "matter_thread_soc_evse_app_series_2_freertos.slpb"

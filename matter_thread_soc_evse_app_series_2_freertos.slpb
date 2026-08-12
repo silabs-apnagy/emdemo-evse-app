@@ -1,0 +1,16 @@
+---
+parameters: []
+constants:
+- name: "workspace_name"
+  value: "matter_thread_soc_evse_app_series_2_freertos"
+- path: "matter_thread_soc_evse_app_freertos/matter_thread_soc_evse_app_freertos.slpb"
+- path: "matter_bootloader_external_series_2/matter_bootloader_external_series_2.slpb"
+steps:
+- task: "convert"
+  output: "artifact/{{workspace_name}}_full.s37"
+  input:
+  - "{{bootloader_binary}}"
+  - "{{application_binary}}"
+- task: "create_gbl"
+  output: "artifact/{{workspace_name}}_app_only.gbl"
+  app: "{{application_binary}}"

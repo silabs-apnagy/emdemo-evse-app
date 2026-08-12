@@ -1,0 +1,12 @@
+autogen/
+simplicity_sdk*/
+.projectlinkstore
+**/cmake_gcc/build/
+cmake_gcc/build/
+*.cmake
+CMakePresets.json
+*.conf
+.vscode/
+artifact/
+trashed_modified_files/
+.DS_Store

@@ -1,0 +1,15 @@
+{
+	"folders": [
+		{
+			"path": "../../../MatterSolarPanelSolution"
+		},
+		{
+			"name": "matter_thread_soc_evse_app_series_2_freertos",
+			"path": "../.."
+		},
+		{
+			"name": "MatterElectricalMeterSolution",
+			"path": "../../../MatterElectricalMeterSolution"
+		}
+	]
+}
