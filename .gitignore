@@ -10,3 +10,4 @@ CMakePresets.json
 artifact/
 trashed_modified_files/
 .DS_Store
+.codex
