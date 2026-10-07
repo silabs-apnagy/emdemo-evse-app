@@ -2,6 +2,9 @@
 
 #include <cmath>
 #include <cstdlib>
+#include <limits>
+
+#include <lib/support/logging/CHIPLogging.h>
 
 namespace {
 constexpr double kJitterPercent = 0.03;
@@ -23,6 +26,10 @@ void SimulatedEv::Init()
     mSnapshot.energyWh    = (static_cast<double>(mSnapshot.socPercent) / 100.0) * (mBatteryKwh * 1000.0);
     mSnapshot.activePowerW = 0.0;
     mSnapshot.rmsCurrentA  = 0.0;
+    mSnapshot.cumulativeEnergyImportedMilliWh = 0;
+    mImportedEnergyFractionalMilliWh = 0.0;
+    mImportedEnergySaturated = false;
+    mSnapshot.capacityWh = mBatteryKwh * 1000.0;
 
     RecomputeDerived();
 }
@@ -35,6 +42,7 @@ void SimulatedEv::ToggleConnected()
     {
         mSnapshot.activePowerW = 0.0;
         mSnapshot.rmsCurrentA  = 0.0;
+    } else {
         ResetSocToDemoValue();
     }
 
@@ -105,15 +113,48 @@ void SimulatedEv::Tick(double dtSeconds)
 
     if (mSnapshot.connected && mSnapshot.evseEnabled && mSnapshot.activePowerW > 0.0)
     {
-        mSnapshot.energyWh += (mSnapshot.activePowerW * dtSeconds) / 3600.0;
-
+        const double energyDeltaWh = (mSnapshot.activePowerW * dtSeconds) / 3600.0;
+        mSnapshot.energyWh += energyDeltaWh;
+        AccumulateCumulativeImportedEnergy(energyDeltaWh * 1000.0);
+        
         const double capacityWh = mBatteryKwh * 1000.0;
         mSnapshot.energyWh      = Clamp(mSnapshot.energyWh, 0.0, capacityWh);
         const double soc        = capacityWh > 0.0 ? (mSnapshot.energyWh / capacityWh) * 100.0 : 0.0;
         mSnapshot.socPercent    = static_cast<uint8_t>(Clamp(soc, 0.0, 100.0) + 0.5);
+        
     }
 
     RecomputeDerived();
+}
+
+void SimulatedEv::AccumulateCumulativeImportedEnergy(double deltaMilliWh)
+{
+    if (mImportedEnergySaturated)
+    {
+        return;
+    }
+
+    const double accumulatedMilliWh = deltaMilliWh + mImportedEnergyFractionalMilliWh;
+    if (!std::isfinite(accumulatedMilliWh) || accumulatedMilliWh < 0.0)
+    {
+        ChipLogError(AppServer, "Invalid imported-energy increment: %.3f mWh", accumulatedMilliWh);
+        return;
+    }
+
+    const double wholeMilliWh = std::floor(accumulatedMilliWh);
+    const int64_t remainingMilliWh = std::numeric_limits<int64_t>::max() - mSnapshot.cumulativeEnergyImportedMilliWh;
+    if (wholeMilliWh >= static_cast<double>(remainingMilliWh))
+    {
+        mSnapshot.cumulativeEnergyImportedMilliWh = std::numeric_limits<int64_t>::max();
+        mImportedEnergyFractionalMilliWh = 0.0;
+        mImportedEnergySaturated = true;
+        ChipLogError(AppServer, "Cumulative imported-energy counter saturated at INT64_MAX mWh");
+        return;
+    }
+
+    const int64_t wholeIncrement = static_cast<int64_t>(wholeMilliWh);
+    mSnapshot.cumulativeEnergyImportedMilliWh += wholeIncrement;
+    mImportedEnergyFractionalMilliWh = accumulatedMilliWh - wholeMilliWh;
 }
 
 void SimulatedEv::RecomputeDerived()

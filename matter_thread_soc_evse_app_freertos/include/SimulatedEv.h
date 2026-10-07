@@ -21,6 +21,9 @@ public:
         double activePowerW = 0.0;
         double rmsCurrentA  = 0.0;
         double energyWh     = 0.0;
+        int64_t cumulativeEnergyImportedMilliWh = 0;
+        double capacityWh     = 0.0;
+        double cableAssemblyLimitmA = 16000.0;
     };
 
     void Init();
@@ -35,6 +38,7 @@ public:
 
 private:
     void RecomputeDerived();
+    void AccumulateCumulativeImportedEnergy(double deltaMilliWh);
 
     Snapshot mSnapshot;
     double mBatteryKwh       = 60.0;
@@ -42,4 +46,6 @@ private:
     double mMaxPowerW        = 0.0;
     double mPowerSlewWPerSec = 500.0;
     uint32_t mJitterCounter  = 0;
+    double mImportedEnergyFractionalMilliWh = 0.0;
+    bool mImportedEnergySaturated = false;
 };
