@@ -12,6 +12,7 @@
 
 #include "CustomerAppTask.h"
 
+#include <algorithm>
 #include <cerrno>
 #include <cstdlib>
 
@@ -24,6 +25,7 @@
 #include <EVSEManufacturerImpl.h>
 #include <EnergyEvseMain.h>
 #include <app-common/zap-generated/cluster-enums.h>
+#include <energy-evse-modes.h>
 #include <lib/support/CodeUtils.h>
 #include <lib/support/logging/CHIPLogging.h>
 #include <platform/CHIPDeviceLayer.h>
@@ -41,6 +43,7 @@ using chip::app::Clusters::EnergyEvse::EVSEManufacturer;
 using chip::app::Clusters::EnergyEvse::GetEvseManufacturer;
 using chip::app::Clusters::EnergyEvse::StateEnum;
 using chip::app::Clusters::EnergyEvse::SupplyStateEnum;
+using EnergyEvseInstance = chip::app::Clusters::EnergyEvse::Instance;
 
 using chip::Shell::Engine;
 using chip::Shell::shell_command_t;
@@ -63,6 +66,12 @@ namespace {
 
 constexpr uint8_t kEvConnectionLed = 1;
 constexpr double kSimulationSecondsPerTick = 50.0;
+constexpr int64_t kDemoCircuitCapacitymA = 16000;
+constexpr int64_t kDemoHardwareCurrentLimitmA = 16000;
+constexpr int64_t kDemoCableCurrentLimitmA = 16000;
+constexpr int64_t kDemoMainsVoltageMilliVolts = 230000;
+constexpr uint8_t kDefaultTargetSocPercent = 80;
+constexpr uint32_t kMinimumChargeCurrentmA = 6000;
 
 DrivePhase sDrivePhase;
 SimulatedEv sSimulatedEv;
@@ -70,6 +79,8 @@ LEDWidget sConnectionLed;
 TimerHandle_t sEvSimulationTimer = nullptr;
 uint8_t sPreviousSoc              = 40;
 bool sPreviousChargingState       = false;
+bool sEvseLimitsInitialized       = false;
+int64_t sPreviousRequiredEnergyMilliWh = -1;
 
 #ifdef DISPLAY_ENABLED
 constexpr uint8_t kHeaderLine             = 5;
@@ -177,7 +188,12 @@ void CustomerAppTask::OnEvSimTick()
 {
     EVSEManufacturer * manufacturer = nullptr;
     chip::app::Clusters::EnergyEvse::EnergyEvseDelegate * evseDelegate = nullptr;
+    EnergyEvseInstance * instance = nullptr;
     bool chargingEnabled = false;
+    bool solarManagedMode = false;
+    uint32_t maximumCurrentmA = kDemoCircuitCapacitymA;
+    uint32_t minimumCurrentmA = kMinimumChargeCurrentmA;
+    uint8_t targetSocPercent = kDefaultTargetSocPercent;
 
     chip::DeviceLayer::PlatformMgr().LockChipStack();
     manufacturer = GetEvseManufacturer();
@@ -186,15 +202,59 @@ void CustomerAppTask::OnEvSimTick()
         evseDelegate = manufacturer->GetEvseDelegate();
         if (evseDelegate != nullptr)
         {
+            instance = evseDelegate->GetInstance();
+            if (!sEvseLimitsInitialized && instance != nullptr)
+            {
+                evseDelegate->HwSetMaxHardwareChargeCurrentLimit(kDemoHardwareCurrentLimitmA);
+                evseDelegate->HwSetCircuitCapacity(kDemoCircuitCapacitymA);
+                evseDelegate->HwSetNominalMainsVoltage(kDemoMainsVoltageMilliVolts);
+                evseDelegate->HwSetCableAssemblyLimit(kDemoCableCurrentLimitmA);
+                // The SDK cluster starts UserMaximumChargeCurrent at 0, and the sample
+                // delegate includes it in the effective-limit minimum. Seed the demo
+                // preference once so an enabled EVSE is not permanently capped at 0 A.
+                if (instance->GetUserMaximumChargeCurrent() == 0)
+                {
+                    TEMPORARY_RETURN_IGNORED instance->SetUserMaximumChargeCurrent(kDemoCircuitCapacitymA);
+                }
+                sEvseLimitsInitialized = true;
+                ChipLogProgress(AppServer, "Configured SimEV supply limits: circuit/hardware/cable=%ld mA, mains=%ld mV",
+                                static_cast<long>(kDemoCircuitCapacitymA), static_cast<long>(kDemoMainsVoltageMilliVolts));
+            }
             chargingEnabled = evseDelegate->GetSupplyState() == SupplyStateEnum::kChargingEnabled;
-        }
-    }
-    if (manufacturer != nullptr)
-    {
-        evseDelegate = manufacturer->GetEvseDelegate();
-        if (evseDelegate != nullptr)
-        {
-            chargingEnabled = evseDelegate->GetSupplyState() == SupplyStateEnum::kChargingEnabled;
+            if (instance != nullptr)
+            {
+                auto * modeInstance = chip::app::Clusters::EnergyEvseMode::Instance();
+                const uint8_t currentMode = modeInstance == nullptr ? chip::app::Clusters::EnergyEvseMode::kModeManual :
+                    modeInstance->GetCurrentMode();
+                solarManagedMode = currentMode == chip::app::Clusters::EnergyEvseMode::kModeSolarCharging ||
+                    currentMode == chip::app::Clusters::EnergyEvseMode::kModeTimeOfUseAndSolarCharging;
+
+                if (solarManagedMode)
+                {
+                    maximumCurrentmA = static_cast<uint32_t>(std::max<int64_t>(0, evseDelegate->GetMaximumChargeCurrent()));
+                    minimumCurrentmA = static_cast<uint32_t>(std::max<int64_t>(kMinimumChargeCurrentmA,
+                        evseDelegate->GetMinimumChargeCurrent()));
+                }
+                else
+                {
+                    // Manual mode ignores command and user current caps, but never the configured circuit ceiling.
+                    const int64_t hardLimitmA = std::min({ evseDelegate->GetCircuitCapacity(),
+                        evseDelegate->HwGetMaxHardwareChargeCurrentLimit(), evseDelegate->HwGetCableAssemblyLimit() });
+                    maximumCurrentmA = static_cast<uint32_t>(std::max<int64_t>(0, hardLimitmA));
+                    minimumCurrentmA = kMinimumChargeCurrentmA;
+                }
+
+                auto targetSoc = instance->GetNextChargeTargetSoC();
+                if (targetSoc.IsNull())
+                {
+                    TEMPORARY_RETURN_IGNORED instance->SetNextChargeTargetSoC(chip::app::DataModel::MakeNullable(
+                        static_cast<chip::Percent>(kDefaultTargetSocPercent)));
+                }
+                else
+                {
+                    targetSocPercent = static_cast<uint8_t>(targetSoc.Value());
+                }
+            }
         }
     }
     chip::DeviceLayer::PlatformMgr().UnlockChipStack();
@@ -238,6 +298,8 @@ void CustomerAppTask::OnEvSimTick()
     
 
     sSimulatedEv.SetEvseEnabled(chargingEnabled);
+    sSimulatedEv.SetCurrentLimits(maximumCurrentmA, minimumCurrentmA);
+    sSimulatedEv.SetTargetSocPercent(targetSocPercent);
     sSimulatedEv.Tick(kSimulationSecondsPerTick);
     const SimulatedEv::Snapshot snapshot = sSimulatedEv.GetSnapshot();
 
@@ -246,7 +308,6 @@ void CustomerAppTask::OnEvSimTick()
     {
         evseDelegate->HwSetState(StateEnum::kNotPluggedIn);
     } else {
-        TEMPORARY_RETURN_IGNORED evseDelegate->HwSetCableAssemblyLimit(static_cast<int64_t>(snapshot.cableAssemblyLimitmA));
         if (snapshot.demand)
         {
             evseDelegate->HwSetState(StateEnum::kPluggedInDemand);
@@ -258,20 +319,22 @@ void CustomerAppTask::OnEvSimTick()
     }
     
     
-    chip::app::Clusters::EnergyEvse::Instance * instance = evseDelegate->GetInstance();
-
-    chip::DeviceLayer::PlatformMgr().UnlockChipStack();
     if(instance == nullptr){
+        chip::DeviceLayer::PlatformMgr().UnlockChipStack();
         ChipLogError(AppServer, "SimEV cannot access the EVSE instance");
-        
         return;
     }
-    chip::DeviceLayer::PlatformMgr().LockChipStack();
 
     TEMPORARY_RETURN_IGNORED instance->SetStateOfCharge(chip::app::DataModel::MakeNullable(
             static_cast<chip::Percent>(snapshot.socPercent)));
     TEMPORARY_RETURN_IGNORED instance->SetBatteryCapacity(chip::app::DataModel::MakeNullable(
             static_cast<int64_t>(snapshot.capacityWh * 1000.0)));
+    if (snapshot.nextChargeRequiredEnergyMilliWh != sPreviousRequiredEnergyMilliWh)
+    {
+        TEMPORARY_RETURN_IGNORED instance->SetNextChargeRequiredEnergy(chip::app::DataModel::MakeNullable(
+            snapshot.nextChargeRequiredEnergyMilliWh));
+        sPreviousRequiredEnergyMilliWh = snapshot.nextChargeRequiredEnergyMilliWh;
+    }
 
 
     if (auto * sensorManager = manufacturer->GetESManager())

@@ -22,6 +22,7 @@ public:
         double rmsCurrentA  = 0.0;
         double energyWh     = 0.0;
         int64_t cumulativeEnergyImportedMilliWh = 0;
+        int64_t nextChargeRequiredEnergyMilliWh = 0;
         double capacityWh     = 0.0;
         double cableAssemblyLimitmA = 16000.0;
     };
@@ -33,6 +34,8 @@ public:
     void ResetSocToDemoValue();
     double GetRandomLowerSoc(double limit);
     void SetEvseEnabled(bool enabled);
+    void SetCurrentLimits(uint32_t maximumCurrentmA, uint32_t minimumCurrentmA);
+    void SetTargetSocPercent(uint8_t targetSocPercent);
 
     Snapshot GetSnapshot() const { return mSnapshot; }
 
@@ -43,7 +46,9 @@ private:
     Snapshot mSnapshot;
     double mBatteryKwh       = 60.0;
     double mMaxCurrentA      = 16.0;
+    double mMinimumCurrentA  = 6.0;
     double mMaxPowerW        = 0.0;
+    uint8_t mTargetSocPercent = 80;
     double mPowerSlewWPerSec = 500.0;
     uint32_t mJitterCounter  = 0;
     double mImportedEnergyFractionalMilliWh = 0.0;

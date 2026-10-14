@@ -11,3 +11,4 @@ artifact/
 trashed_modified_files/
 .DS_Store
 .codex
+.silabsExtContext

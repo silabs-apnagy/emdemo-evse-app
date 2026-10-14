@@ -30,6 +30,10 @@ void SimulatedEv::Init()
     mImportedEnergyFractionalMilliWh = 0.0;
     mImportedEnergySaturated = false;
     mSnapshot.capacityWh = mBatteryKwh * 1000.0;
+    mTargetSocPercent = 80;
+    mMinimumCurrentA = 6.0;
+    mMaxCurrentA = 16.0;
+    mMaxPowerW = mSnapshot.vrms * mMaxCurrentA * mSnapshot.powerFactor;
 
     RecomputeDerived();
 }
@@ -70,6 +74,20 @@ void SimulatedEv::SetEvseEnabled(bool enabled)
     RecomputeDerived();
 }
 
+void SimulatedEv::SetCurrentLimits(uint32_t maximumCurrentmA, uint32_t minimumCurrentmA)
+{
+    mMaxCurrentA = static_cast<double>(maximumCurrentmA) / 1000.0;
+    mMinimumCurrentA = static_cast<double>(minimumCurrentmA) / 1000.0;
+    mMaxPowerW = mSnapshot.vrms * mMaxCurrentA * mSnapshot.powerFactor;
+    RecomputeDerived();
+}
+
+void SimulatedEv::SetTargetSocPercent(uint8_t targetSocPercent)
+{
+    mTargetSocPercent = targetSocPercent > 100 ? 100 : targetSocPercent;
+    RecomputeDerived();
+}
+
 void SimulatedEv::Tick(double dtSeconds)
 {
     if (dtSeconds <= 0.0)
@@ -80,18 +98,11 @@ void SimulatedEv::Tick(double dtSeconds)
     RecomputeDerived();
 
     double targetPowerW = 0.0;
-    if (mSnapshot.connected && mSnapshot.demand && mSnapshot.evseEnabled)
+    if (mSnapshot.connected && mSnapshot.demand && mSnapshot.evseEnabled && mMaxCurrentA >= mMinimumCurrentA)
     {
-        double taper = 1.0;
-        if (mSnapshot.socPercent >= 80)
-        {
-            const double progress = (static_cast<double>(mSnapshot.socPercent) - 80.0) / 20.0;
-            taper                 = Clamp(1.0 - 0.8 * progress, 0.2, 1.0);
-        }
-
-        const double sign   = ((++mJitterCounter) & 1U) ? 1.0 : -1.0;
-        const double jitter = 1.0 + sign * kJitterPercent;
-        targetPowerW        = mMaxPowerW * taper * jitter;
+        ++mJitterCounter;
+        const double jitter = 1.0 - (static_cast<double>(mJitterCounter % 2U) * kJitterPercent);
+        targetPowerW        = mMaxPowerW * jitter;
     }
 
     const double maximumStep = mPowerSlewWPerSec * dtSeconds;
@@ -99,7 +110,7 @@ void SimulatedEv::Tick(double dtSeconds)
     delta                    = Clamp(delta, -maximumStep, maximumStep);
     mSnapshot.activePowerW += delta;
 
-    if (!mSnapshot.connected || mSnapshot.activePowerW <= 1.0)
+    if (!mSnapshot.connected || !mSnapshot.demand || mMaxCurrentA < mMinimumCurrentA || mSnapshot.activePowerW <= 1.0)
     {
         mSnapshot.activePowerW = 0.0;
         mSnapshot.rmsCurrentA  = 0.0;
@@ -111,9 +122,12 @@ void SimulatedEv::Tick(double dtSeconds)
         mSnapshot.rmsCurrentA    = Clamp(currentA, 0.0, mMaxCurrentA);
     }
 
-    if (mSnapshot.connected && mSnapshot.evseEnabled && mSnapshot.activePowerW > 0.0)
+    if (mSnapshot.connected && mSnapshot.demand && mSnapshot.evseEnabled &&
+        mMaxCurrentA >= mMinimumCurrentA && mSnapshot.activePowerW > 0.0)
     {
-        const double energyDeltaWh = (mSnapshot.activePowerW * dtSeconds) / 3600.0;
+        const double requestedEnergyDeltaWh = (mSnapshot.activePowerW * dtSeconds) / 3600.0;
+        const double targetEnergyWh = (static_cast<double>(mTargetSocPercent) / 100.0) * mSnapshot.capacityWh;
+        const double energyDeltaWh = Clamp(requestedEnergyDeltaWh, 0.0, targetEnergyWh - mSnapshot.energyWh);
         mSnapshot.energyWh += energyDeltaWh;
         AccumulateCumulativeImportedEnergy(energyDeltaWh * 1000.0);
         
@@ -123,6 +137,10 @@ void SimulatedEv::Tick(double dtSeconds)
         mSnapshot.socPercent    = static_cast<uint8_t>(Clamp(soc, 0.0, 100.0) + 0.5);
         
     }
+
+    const double targetEnergyWh = (static_cast<double>(mTargetSocPercent) / 100.0) * mSnapshot.capacityWh;
+    const double remainingWh = Clamp(targetEnergyWh - mSnapshot.energyWh, 0.0, mSnapshot.capacityWh);
+    mSnapshot.nextChargeRequiredEnergyMilliWh = static_cast<int64_t>(std::llround(remainingWh * 1000.0));
 
     RecomputeDerived();
 }
@@ -159,6 +177,7 @@ void SimulatedEv::AccumulateCumulativeImportedEnergy(double deltaMilliWh)
 
 void SimulatedEv::RecomputeDerived()
 {
-    mSnapshot.demand   = mSnapshot.connected && mSnapshot.socPercent < 100;
-    mSnapshot.charging = mSnapshot.connected && mSnapshot.demand && mSnapshot.evseEnabled;
+    mSnapshot.demand   = mSnapshot.connected && mSnapshot.energyWh < (static_cast<double>(mTargetSocPercent) / 100.0) * mSnapshot.capacityWh;
+    mSnapshot.charging = mSnapshot.connected && mSnapshot.demand && mSnapshot.evseEnabled &&
+        mMaxCurrentA >= mMinimumCurrentA && mSnapshot.activePowerW > 1.0;
 }
