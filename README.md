@@ -1,5 +1,8 @@
 # Matter over Thread EVSE Solution — Version 2.0
 
+See [conference MVP status](CONFERENCE_MVP.md) for implemented preview scope,
+local changes, safety/mode ownership, and validation/pinning caveats.
+
 This repository contains the complete Silicon Labs Simplicity Studio 6 solution for the Matter over Thread Electric Vehicle Supply Equipment (EVSE) application. Version 2.0 ports the solution to Simplicity SDK 2026.6.1 and includes both the EVSE application and its Series 2 external-storage bootloader project.
 
 ## Clone

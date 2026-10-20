@@ -13,11 +13,6 @@
 #include "CustomerAppTask.h"
 
 #include <algorithm>
-#include <cerrno>
-#include <cstdlib>
-
-#include <lib/shell/Engine.h>
-#include <lib/shell/commands/Help.h>
 
 #include "EvseConfig.h"
 #include "SimulatedEv.h"
@@ -45,27 +40,13 @@ using chip::app::Clusters::EnergyEvse::StateEnum;
 using chip::app::Clusters::EnergyEvse::SupplyStateEnum;
 using EnergyEvseInstance = chip::app::Clusters::EnergyEvse::Instance;
 
-using chip::Shell::Engine;
-using chip::Shell::shell_command_t;
-
-Engine sCustomCommands;
-
-constexpr uint32_t kDriveDisconnectedSeconds = 2;
-constexpr uint32_t kMaxDriveIntervalSeconds = 24 * 60 * 60;
-
-bool sDriveTimerEnabled = false;
-uint32_t sDriveIntervalSeconds = 0;
-uint32_t sDriveSecondsRemaining = 0;
-
-enum class DrivePhase
-{
-    Connected,
-    Disconnected,
-};
 namespace {
 
+// One demo-loop minute is one real minute. Charging energy retains its
+// separate acceleration below; the trip duration uses real RTOS elapsed time.
+constexpr uint32_t kDriveDisconnectedSeconds = 4 * 60;
 constexpr uint8_t kEvConnectionLed = 1;
-constexpr double kSimulationSecondsPerTick = 50.0;
+constexpr double kSimulationSecondsPerTick = 60.0;
 constexpr int64_t kDemoCircuitCapacitymA = 16000;
 constexpr int64_t kDemoHardwareCurrentLimitmA = 16000;
 constexpr int64_t kDemoCableCurrentLimitmA = 16000;
@@ -73,13 +54,15 @@ constexpr int64_t kDemoMainsVoltageMilliVolts = 230000;
 constexpr uint8_t kDefaultTargetSocPercent = 80;
 constexpr uint32_t kMinimumChargeCurrentmA = 6000;
 
-DrivePhase sDrivePhase;
+bool sAutomaticDriveActive = false;
+TickType_t sDriveStartedAt = 0;
 SimulatedEv sSimulatedEv;
 LEDWidget sConnectionLed;
 TimerHandle_t sEvSimulationTimer = nullptr;
 uint8_t sPreviousSoc              = 40;
 bool sPreviousChargingState       = false;
 bool sEvseLimitsInitialized       = false;
+bool sReportedConnected          = false;
 int64_t sPreviousRequiredEnergyMilliWh = -1;
 
 #ifdef DISPLAY_ENABLED
@@ -134,13 +117,9 @@ AppTask & AppTask::GetAppTask()
     return CustomerAppTask::GetAppTask();
 }
 
-static void RegisterCustomShellCommands();
-
 CHIP_ERROR CustomerAppTask::AppInitImpl()
 {
     ReturnErrorOnFailure(AppTask::AppInit());
-
-    RegisterCustomShellCommands();
 
     sSimulatedEv.Init();
     sConnectionLed.Init(kEvConnectionLed);
@@ -171,16 +150,14 @@ void CustomerAppTask::EnergyManagementActionEventHandlerImpl(AppEvent * event)
         return;
     }
 
-    if(sDriveTimerEnabled){
-        ChipLogError(AppServer, "Manual EV connection IGNORED while drive timer is active.");
-    } else {
-        sSimulatedEv.ToggleConnected();
-        const SimulatedEv::Snapshot snapshot = sSimulatedEv.GetSnapshot();
-        sConnectionLed.Set(snapshot.connected);
-        CustomerAppTask::GetAppTask().RequestDemoScreenRefresh();
-
-        ChipLogProgress(AppServer, "SimEV %s", snapshot.connected ? "connected" : "disconnected");
-    }
+    // A deliberate connection change always wins and cancels a scheduled
+    // return, so an old trip cannot toggle the vehicle again afterward.
+    sAutomaticDriveActive = false;
+    sSimulatedEv.ToggleConnected();
+    const SimulatedEv::Snapshot snapshot = sSimulatedEv.GetSnapshot();
+    sConnectionLed.Set(snapshot.connected);
+    RequestDemoScreenRefresh();
+    ChipLogProgress(AppServer, "SimEV manually %s", snapshot.connected ? "connected" : "disconnected");
    
 }
 
@@ -265,34 +242,15 @@ void CustomerAppTask::OnEvSimTick()
         return;
     }
 
-    if (sDriveTimerEnabled && sDriveSecondsRemaining > 0)
+    const bool previouslyConnected = sSimulatedEv.GetSnapshot().connected;
+    if (sAutomaticDriveActive &&
+        static_cast<TickType_t>(xTaskGetTickCount() - sDriveStartedAt) >= pdMS_TO_TICKS(kDriveDisconnectedSeconds * 1000))
     {
-        --sDriveSecondsRemaining;
-
-        if (sDriveSecondsRemaining == 0)
+        sAutomaticDriveActive = false;
+        if (!sSimulatedEv.GetSnapshot().connected)
         {
             sSimulatedEv.ToggleConnected();
-
-            const SimulatedEv::Snapshot snapshot = sSimulatedEv.GetSnapshot();
-
-            if (snapshot.connected)
-            {
-                sDrivePhase = DrivePhase::Connected;
-                sDriveSecondsRemaining = sDriveIntervalSeconds;
-                chip::DeviceLayer::PlatformMgr().LockChipStack();
-                TEMPORARY_RETURN_IGNORED evseDelegate->HwSetCableAssemblyLimit(static_cast<int64_t>(snapshot.cableAssemblyLimitmA));
-                chip::DeviceLayer::PlatformMgr().UnlockChipStack();
-                ChipLogProgress(AppServer, "EV drive complete; SimEV reconnected");
-            }
-            else
-            {
-                sDrivePhase = DrivePhase::Disconnected;
-                sDriveSecondsRemaining = kDriveDisconnectedSeconds;
-                ChipLogProgress(AppServer, "SimEV disconnected for simulated drive");
-            }
-
-            sConnectionLed.Set(snapshot.connected);
-            RequestDemoScreenRefresh();
+            ChipLogProgress(AppServer, "EV drive complete; SimEV reconnected");
         }
     }
     
@@ -301,9 +259,31 @@ void CustomerAppTask::OnEvSimTick()
     sSimulatedEv.SetCurrentLimits(maximumCurrentmA, minimumCurrentmA);
     sSimulatedEv.SetTargetSocPercent(targetSocPercent);
     sSimulatedEv.Tick(kSimulationSecondsPerTick);
-    const SimulatedEv::Snapshot snapshot = sSimulatedEv.GetSnapshot();
+    SimulatedEv::Snapshot snapshot = sSimulatedEv.GetSnapshot();
+    // Demand is based on exact battery energy and the configured target, not
+    // rounded display SoC or a hard-coded 100-percent threshold.
+    if (snapshot.connected && !snapshot.demand)
+    {
+        sSimulatedEv.ToggleConnected();
+        snapshot = sSimulatedEv.GetSnapshot();
+        sAutomaticDriveActive = true;
+        sDriveStartedAt = xTaskGetTickCount();
+        ChipLogProgress(AppServer, "EV reached target %u%%; disconnected for a %lu-second drive",
+                        static_cast<unsigned>(targetSocPercent),
+                        static_cast<unsigned long>(kDriveDisconnectedSeconds));
+    }
+    if (snapshot.connected != previouslyConnected)
+    {
+        sConnectionLed.Set(snapshot.connected);
+        RequestDemoScreenRefresh();
+    }
 
     chip::DeviceLayer::PlatformMgr().LockChipStack();
+    if (snapshot.connected && !sReportedConnected)
+    {
+        TEMPORARY_RETURN_IGNORED evseDelegate->HwSetCableAssemblyLimit(static_cast<int64_t>(snapshot.cableAssemblyLimitmA));
+    }
+    sReportedConnected = snapshot.connected;
     if (!snapshot.connected)
     {
         evseDelegate->HwSetState(StateEnum::kNotPluggedIn);
@@ -383,107 +363,4 @@ void CustomerAppTask::RequestDemoScreenRefresh()
         BaseApplication::PostUpdateDisplayEvent(SilabsLCD::Screen_e::DemoScreen);
     }
 #endif
-}
-
-CHIP_ERROR CustomHelpHandler(int argc, char ** argv)
-{
-    sCustomCommands.ForEachCommand(chip::Shell::PrintCommandHelp, nullptr);
-    return CHIP_NO_ERROR;
-}
-
-CHIP_ERROR EvDriveTimerHandler(int argc, char ** argv)
-{
-    if (argc != 1 || argv[0] == nullptr)
-    {
-        ChipLogError(Shell, "Usage: custom ev-drive-timer <connected-seconds>");
-        return CHIP_ERROR_INVALID_ARGUMENT;
-    }
-
-    errno = 0;
-    char * end = nullptr;
-    unsigned long interval = std::strtoul(argv[0], &end, 10);
-
-    if (errno != 0 || end == argv[0] || *end != '\0' || interval == 0 ||
-        interval > kMaxDriveIntervalSeconds)
-    {
-        ChipLogError(Shell, "Drive interval must be between 1 and %lu seconds",
-                     static_cast<unsigned long>(kMaxDriveIntervalSeconds));
-        return CHIP_ERROR_INVALID_ARGUMENT;
-    }
-
-    sDriveIntervalSeconds = static_cast<uint32_t>(interval);
-
-    AppEvent event{};
-    event.Type = AppEvent::kEventType_Timer;
-    event.Handler = [](AppEvent *) {
-        const SimulatedEv::Snapshot snapshot = sSimulatedEv.GetSnapshot();
-
-        sDriveTimerEnabled = true;
-        sDrivePhase = snapshot.connected ? DrivePhase::Connected : DrivePhase::Disconnected;
-        sDriveSecondsRemaining =
-            snapshot.connected ? sDriveIntervalSeconds : kDriveDisconnectedSeconds;
-
-        ChipLogProgress(Shell, "EV drive timer started: connected interval=%lu seconds",
-                        static_cast<unsigned long>(sDriveIntervalSeconds));
-    };
-
-    CustomerAppTask::GetAppTask().PostEvent(&event);
-    return CHIP_NO_ERROR;
-}
-
-CHIP_ERROR EvDriveStopHandler(int argc, char ** argv)
-{
-    if (argc != 0)
-    {
-        ChipLogError(Shell, "Usage: custom ev-drive-stop");
-        return CHIP_ERROR_INVALID_ARGUMENT;
-    }
-
-    AppEvent event{};
-    event.Type = AppEvent::kEventType_Timer;
-    event.Handler = [](AppEvent *) {
-        sDriveTimerEnabled = false;
-        sDriveSecondsRemaining = 0;
-
-        const SimulatedEv::Snapshot snapshot = sSimulatedEv.GetSnapshot();
-        sDrivePhase = snapshot.connected ? DrivePhase::Connected : DrivePhase::Disconnected;
-
-        ChipLogProgress(Shell, "EV drive timer stopped; SimEV remains %s",
-                        snapshot.connected ? "connected" : "disconnected");
-    };
-
-    CustomerAppTask::GetAppTask().PostEvent(&event);
-    return CHIP_NO_ERROR;
-}
-
-CHIP_ERROR CustomCommandHandler(int argc, char ** argv)
-{
-    if (argc == 0)
-    {
-        return CustomHelpHandler(argc, argv);
-    }
-
-    return sCustomCommands.ExecCommand(argc, argv);
-}
-
-static void RegisterCustomShellCommands()
-{
-    static const shell_command_t commands[] = {
-        { &CustomHelpHandler, "help", "Show custom command help" },
-        { &EvDriveTimerHandler, "ev-drive-timer",
-            "Usage: custom ev-drive-timer <connected-seconds>" },
-        { &EvDriveStopHandler, "ev-drive-stop",
-            "Stop automatic EV drive cycling; leave connection unchanged" },
-    };
-
-    static const shell_command_t customCommand = {
-        &CustomCommandHandler,
-        "custom",
-        "Custom EVSE demo commands",
-    };
-
-    
-
-    sCustomCommands.RegisterCommands(commands, MATTER_ARRAY_SIZE(commands));
-    Engine::Root().RegisterCommands(&customCommand, 1);
 }
