@@ -1,10 +1,12 @@
 # EVSE + SimEV — conference 2.0 preview
 
 Checkpoint: **2026-10-20**. Feature scope is frozen; bug fixes/validation only.
-Working branch: `evse2.0`. Committed base: `61f8249`; target-completion auto-trip
-changes remain local and must be committed before updating the super-repo pin.
+Working branch: `evse2.0`. Behavior baseline: `3c67b75`, including target-completion
+auto-trip and removal of obsolete CLI controls. The operator confirms the running
+firmware represents the demo behavior below. Exact flashed artifact hashes remain
+to record.
 
-## Current local behavior
+## Current demo behavior
 
 - xG24 / BRD4187C Matter-over-Thread EVSE and local simulated vehicle.
 - Demo circuit/hardware/cable ceilings: 16 A; minimum charging current: 6 A.
